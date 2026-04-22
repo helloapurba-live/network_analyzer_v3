@@ -1,0 +1,1685 @@
+Here is the fully reformatted document with proper markdown structure, aligned tables, and consistent section styling throughout.stackoverflow+2
+
+Oracle SQL — Edge All-in-One + Node All-in-One
+Source table: RAW_TRANSACTIONS(SENDER_ID, RECEIVER_ID, AMOUNT, TX_DATETIME DATE)
+Oracle DATE arithmetic: DATE − 1 = exactly 24 hours earlier. DATE − DATE = number of days (decimal).
+
+Block 1 — Edge Table (E1–E7)
+All 7 compensation columns in one query, single pass over the table.
+Output: TRANSACTIONS.CSV for GraphAML (monthly rolled-up edge). Run monthly with 90 days of raw individual transaction data.
+
+sql
+-- ================================================================
+-- EDGE COMPENSATION COLUMNS — E1 to E7
+-- ONE query using CTEs, single pass over the table
+-- Output: TRANSACTIONS.CSV for GraphAML (monthly rolled-up edge)
+-- Run monthly with 90 days of raw individual transaction data
+-- ================================================================
+WITH
+-- ----------------------------------------------------------------
+-- STEP 1: Clean and enrich every raw individual transaction row.
+--         Compute all row-level flags in one place — touch data once.
+-- ----------------------------------------------------------------
+base_prep AS (
+    SELECT
+        SENDER_ID,
+        RECEIVER_ID,
+        AMOUNT,
+        TX_DATETIME,
+        -- Month key = last day of that month
+        -- e.g. any Nov date → 2025-11-30 (this becomes tx_date in GraphAML)
+        LAST_DAY(TRUNC(TX_DATETIME, 'MM'))                               AS TX_MONTH,
+        -- E1 FLAG: is this individual amount in the $8K–$9,999.99 structuring band?
+        --          Criminals deliberately stay just under the $10K reporting threshold.
+        CASE WHEN AMOUNT >= 8000 AND AMOUNT <= 9999.99 THEN 1 ELSE 0 END AS IS_STRUCTURING_BAND,
+        -- E4 FLAG: is this transaction in off-hours? (10pm–6am)
+        --          HH24 returns 0–23; off-hours = 22,23,0,1,2,3,4,5,6
+        CASE
+            WHEN TO_NUMBER(TO_CHAR(TX_DATETIME, 'HH24')) >= 22
+              OR TO_NUMBER(TO_CHAR(TX_DATETIME, 'HH24')) <=  6
+            THEN 1 ELSE 0
+        END                                                              AS IS_OFF_HOURS,
+        -- E5 FLAG: is this a round amount? (divisible by $1,000 within $1 tolerance)
+        --          e.g. $9,000.00 YES  |  $9,700.00 NO  |  $10,000.00 YES
+        CASE WHEN MOD(AMOUNT, 1000) < 1.0 THEN 1 ELSE 0 END             AS IS_ROUND_AMOUNT
+    FROM RAW_TRANSACTIONS
+    WHERE TX_DATETIME IS NOT NULL
+      AND AMOUNT       > 0
+      AND SENDER_ID   IS NOT NULL
+      AND RECEIVER_ID IS NOT NULL
+),
+-- ----------------------------------------------------------------
+-- STEP 2: Find the single global max date across ALL transactions.
+--         Defines where "recent 30 days" begins.
+--         Used only for E6 (recent_tx_count) and E7 (baseline_tx_count).
+-- ----------------------------------------------------------------
+max_date AS (
+    SELECT MAX(TX_DATETIME) AS MAX_DT
+    FROM   RAW_TRANSACTIONS
+),
+-- ----------------------------------------------------------------
+-- STEP 3: Tag each row as RECENT (last 30 days of your window)
+--         or BASELINE (everything older than 30 days).
+--         RECENT   = November individual tx (for Nov run with 90-day window)
+--         BASELINE = September + most of October individual tx
+-- ----------------------------------------------------------------
+tagged AS (
+    SELECT
+        b.*,
+        CASE
+            WHEN b.TX_DATETIME >= (m.MAX_DT - 30) THEN 1
+            ELSE 0
+        END AS IS_RECENT
+    FROM   base_prep b
+    CROSS JOIN max_date m      -- safe: max_date is exactly 1 row
+),
+-- ----------------------------------------------------------------
+-- STEP 4: Final aggregation — one row per (sender, receiver, month).
+--         All 7 compensation columns computed in ONE GROUP BY.
+-- ----------------------------------------------------------------
+aggregated AS (
+    SELECT
+        SENDER_ID,
+        RECEIVER_ID,
+        TX_MONTH                         AS TX_DATE,           -- renamed to match GraphAML column name
+        -- Base rollup columns (already in your file — included for completeness)
+        SUM(AMOUNT)                      AS AMOUNT,            -- total amount this pair this month
+        COUNT(*)                         AS TX_COUNT,          -- total count this pair this month
+        -- E2: smallest individual amount sent between this pair this month
+        --     Monthly sum hides whether it was one big wire or many small cash deposits
+        MIN(AMOUNT)                      AS MIN_AMOUNT,
+        -- E3: largest individual amount sent between this pair this month
+        --     Paired with E2: engine uses range (max−min) as spread signal
+        MAX(AMOUNT)                      AS MAX_AMOUNT,
+        -- E1: count of individual transactions in structuring band ($8K–$9,999.99)
+        --     Monthly sum loses this — $9,700 × 10 = $97,000 hides 10 structuring events
+        SUM(IS_STRUCTURING_BAND)         AS COUNT_STRUCTURING_BAND,
+        -- E4: count of individual transactions at night (10pm–6am)
+        --     Monthly rollup has no tx_hour → engine off_hours_ratio = 0 for all → signal dead
+        SUM(IS_OFF_HOURS)                AS OFF_HOURS_TX_COUNT,
+        -- E5: count of individual transactions with a round amount ($1K, $5K, $10K etc.)
+        --     Engine checks MOD on monthly SUM → $9,700×10=$97,000, $97,000%1000=0 → WRONG
+        SUM(IS_ROUND_AMOUNT)             AS ROUND_AMOUNT_COUNT,
+        -- E6: individual transaction count in most recent 30 days (velocity numerator)
+        --     Without this, engine computes rate = tx_count/1 day instead of /30 → velocity wrong
+        SUM(IS_RECENT)                   AS RECENT_TX_COUNT,
+        -- E7: individual transaction count older than 30 days (velocity baseline/denominator)
+        --     Without this, baseline is empty → engine returns 0.0 for ALL velocity scores (silent)
+        SUM(1 - IS_RECENT)               AS BASELINE_TX_COUNT
+    FROM   tagged
+    GROUP BY SENDER_ID, RECEIVER_ID, TX_MONTH
+)
+-- ----------------------------------------------------------------
+-- FINAL OUTPUT → save as TRANSACTIONS.CSV for GraphAML
+-- ----------------------------------------------------------------
+SELECT
+    SENDER_ID,
+    RECEIVER_ID,
+    TX_DATE,
+    AMOUNT,
+    TX_COUNT,
+    MIN_AMOUNT,
+    MAX_AMOUNT,
+    COUNT_STRUCTURING_BAND,
+    OFF_HOURS_TX_COUNT,
+    ROUND_AMOUNT_COUNT,
+    RECENT_TX_COUNT,
+    BASELINE_TX_COUNT
+FROM   aggregated
+ORDER BY SENDER_ID, RECEIVER_ID, TX_DATE;
+
+Block 2 — Node Table (N1–N6)
+All 6 behavioural profile columns in one query, final LEFT JOINs at the end.
+Output: NODES.CSV for GraphAML (one row per customer). Source: 90 days of raw individual transactions — NOT monthly rollup.
+
+sql
+-- ================================================================
+-- NODE BEHAVIORAL PROFILE COLUMNS — N1 to N6
+-- ONE query using CTEs, final LEFT JOINs at the end
+-- Output: NODES.CSV for GraphAML (one row per customer)
+-- Source: 90 days of RAW individual transactions (NOT monthly rollup)
+-- ================================================================
+WITH
+-- ================================================================
+-- SECTION A: BASE DATA — prepared once, reused by all N1–N6 sections
+-- ================================================================
+sends AS (
+    -- All send events (sender perspective)
+    SELECT
+        SENDER_ID          AS NODE_ID,
+        TX_DATETIME,
+        AMOUNT,
+        TRUNC(TX_DATETIME) AS TX_DATE          -- date only, for dormancy (N5)
+    FROM RAW_TRANSACTIONS
+    WHERE AMOUNT > 0 AND TX_DATETIME IS NOT NULL AND SENDER_ID IS NOT NULL
+),
+recvs AS (
+    -- All receive events (receiver perspective) — used only for relay (N6)
+    SELECT
+        RECEIVER_ID        AS NODE_ID,
+        TX_DATETIME,
+        AMOUNT
+    FROM RAW_TRANSACTIONS
+    WHERE AMOUNT > 0 AND TX_DATETIME IS NOT NULL AND RECEIVER_ID IS NOT NULL
+),
+all_amounts AS (
+    -- All amounts tagged to both sides — used for Benford (N2)
+    -- Benford checks ALL amounts a customer was involved in (sent OR received)
+    SELECT SENDER_ID   AS NODE_ID, AMOUNT FROM RAW_TRANSACTIONS WHERE AMOUNT > 0.01
+    UNION ALL
+    SELECT RECEIVER_ID AS NODE_ID, AMOUNT FROM RAW_TRANSACTIONS WHERE AMOUNT > 0.01
+),
+all_nodes AS (
+    -- Complete customer universe — anyone who ever sent OR received
+    -- Ensures every customer gets a row even if some columns default to 0
+    SELECT DISTINCT SENDER_ID   AS NODE_ID FROM RAW_TRANSACTIONS WHERE SENDER_ID   IS NOT NULL
+    UNION
+    SELECT DISTINCT RECEIVER_ID AS NODE_ID FROM RAW_TRANSACTIONS WHERE RECEIVER_ID IS NOT NULL
+),
+-- ================================================================
+-- SECTION B: N1 — BURSTINESS   B = (σ − μ) / (σ + μ)
+-- Score +1 = completely random sender (normal human)
+-- Score −1 = perfectly regular robot   (suspicious scripted sender)
+-- Source: inter-event gaps in seconds between all sends by this customer
+-- ================================================================
+send_gaps AS (
+    -- Gap in seconds between each send and the previous send on the same customer
+    -- LAG() fetches the previous TX_DATETIME sorted by time within each NODE_ID partition
+    -- Oracle DATE − DATE = days; × 86400 converts to seconds
+    SELECT
+        NODE_ID,
+        (TX_DATETIME
+            - LAG(TX_DATETIME) OVER (PARTITION BY NODE_ID ORDER BY TX_DATETIME)
+        ) * 86400                              AS GAP_SEC
+    FROM sends
+),
+n1_burstiness AS (
+    -- Aggregate gaps: compute mean (mu) and std (sigma)
+    -- HAVING >= 2 gaps = at least 3 transactions
+    SELECT
+        NODE_ID,
+        AVG(GAP_SEC)            AS MU,
+        STDDEV_POP(GAP_SEC)     AS SIGMA,      -- population std (matches Python np.std(ddof=0))
+        COUNT(GAP_SEC)          AS N_GAPS
+    FROM   send_gaps
+    WHERE  GAP_SEC IS NOT NULL                 -- first row per customer always NULL (no prior)
+    GROUP  BY NODE_ID
+    HAVING COUNT(GAP_SEC) >= 2                 -- minimum 3 transactions (2 gaps)
+),
+-- ================================================================
+-- SECTION C: N2 — BENFORD MAD  (Mean Absolute Deviation from Benford's Law)
+-- Score 0 = matches Benford's Law (normal distribution of first digits)
+-- Score 1 = does NOT match      (suspicious — e.g. all amounts start with 9)
+-- Source: all individual amounts sent AND received (combined)
+-- Minimum: 30 amounts (same threshold as engine benford.py)
+-- ================================================================
+fd_extracted AS (
+    -- Extract first significant digit: $9,700→9  |  $1,250→1  |  $45,000→4
+    -- Formula: TRUNC(amount / 10^floor(log10(amount)))
+    -- Example: 9700 → log10=3.98, floor=3, 10^3=1000, 9700/1000=9.7, TRUNC=9 ✓
+    SELECT
+        NODE_ID,
+        AMOUNT,
+        CASE
+            WHEN AMOUNT >= 1
+            THEN TRUNC(AMOUNT / POWER(10, FLOOR(LOG(10, AMOUNT))))
+            ELSE NULL
+        END AS FIRST_DIGIT
+    FROM all_amounts
+    WHERE AMOUNT > 0.01
+),
+fd_valid AS (
+    -- Keep only rows where first digit is cleanly 1–9 (safety filter)
+    SELECT NODE_ID, FIRST_DIGIT
+    FROM   fd_extracted
+    WHERE  FIRST_DIGIT BETWEEN 1 AND 9
+),
+fd_totals AS (
+    -- Total valid amounts per customer — gate at 30 (matches engine threshold)
+    SELECT   NODE_ID, COUNT(*) AS TOTAL
+    FROM     fd_valid
+    GROUP BY NODE_ID
+    HAVING   COUNT(*) >= 30
+),
+fd_by_digit AS (
+    -- Count of amounts starting with each digit 1–9 per customer
+    SELECT   v.NODE_ID, v.FIRST_DIGIT, COUNT(*) AS D_CNT
+    FROM     fd_valid  v
+    JOIN     fd_totals t ON v.NODE_ID = t.NODE_ID
+    GROUP BY v.NODE_ID, v.FIRST_DIGIT
+),
+benford_expected AS (
+    -- Benford's Law: expected frequency of digit d = log10(1 + 1/d)
+    -- These are MATHEMATICAL CONSTANTS — do not change
+    SELECT 1 AS D, LOG(10, 2)    AS E FROM DUAL UNION ALL  -- d=1: ~30.1%
+    SELECT 2,      LOG(10, 1.5)     FROM DUAL UNION ALL    -- d=2: ~17.6%
+    SELECT 3,      LOG(10, 4/3)     FROM DUAL UNION ALL    -- d=3: ~12.5%
+    SELECT 4,      LOG(10, 1.25)    FROM DUAL UNION ALL    -- d=4: ~ 9.7%
+    SELECT 5,      LOG(10, 1.2)     FROM DUAL UNION ALL    -- d=5: ~ 7.9%
+    SELECT 6,      LOG(10, 7/6)     FROM DUAL UNION ALL    -- d=6: ~ 6.7%
+    SELECT 7,      LOG(10, 8/7)     FROM DUAL UNION ALL    -- d=7: ~ 5.8%
+    SELECT 8,      LOG(10, 9/8)     FROM DUAL UNION ALL    -- d=8: ~ 5.1%
+    SELECT 9,      LOG(10, 10/9)    FROM DUAL              -- d=9: ~ 4.6%
+),
+all_digit_slots AS (
+    -- Every customer × all 9 digits (ensures 0-count digits are not dropped)
+    SELECT t.NODE_ID, b.D, b.E
+    FROM   fd_totals t
+    CROSS JOIN benford_expected b
+),
+digit_obs AS (
+    -- Observed frequency vs Benford expected for every customer-digit slot
+    SELECT
+        s.NODE_ID,
+        s.D,
+        s.E                                        AS EXPECTED_FREQ,
+        NVL(dc.D_CNT, 0) / t.TOTAL                AS OBSERVED_FREQ
+        -- NVL: digit absent for this customer → count=0, not NULL
+    FROM   all_digit_slots  s
+    LEFT  JOIN fd_by_digit  dc ON s.NODE_ID = dc.NODE_ID AND s.D = dc.FIRST_DIGIT
+    JOIN   fd_totals         t ON s.NODE_ID  = t.NODE_ID
+),
+n2_benford AS (
+    -- MAD = average |observed − expected| across all 9 digits
+    SELECT
+        NODE_ID,
+        AVG(ABS(OBSERVED_FREQ - EXPECTED_FREQ))    AS MAD_RAW
+    FROM   digit_obs
+    GROUP BY NODE_ID
+),
+-- ================================================================
+-- SECTION D: N3 — DOW ENTROPY  (Day-of-Week Shannon Entropy)
+-- High entropy (→ 2.807) = sends on many different days (normal)
+-- Low entropy  (→ 0)     = always sends on same 1–2 days (suspicious scripted pattern)
+-- Formula: H = −Σ p × log2(p)   |   Max = log2(7) = 2.807
+-- ================================================================
+send_dow AS (
+    -- Extract day of week from each send timestamp
+    -- Oracle TO_CHAR 'D': 1=Sunday … 7=Saturday (default NLS_TERRITORY)
+    SELECT
+        NODE_ID,
+        TO_NUMBER(TO_CHAR(TX_DATETIME, 'D'))   AS DOW
+    FROM sends
+),
+dow_totals AS (
+    -- Only compute for customers with at least 7 sends
+    SELECT   NODE_ID, COUNT(*) AS TOTAL_TX
+    FROM     send_dow
+    GROUP BY NODE_ID
+    HAVING   COUNT(*) >= 7
+),
+dow_probs AS (
+    -- Probability of each day of week per customer
+    SELECT
+        d.NODE_ID,
+        d.DOW,
+        COUNT(*) / t.TOTAL_TX   AS PROB
+    FROM   send_dow   d
+    JOIN   dow_totals t ON d.NODE_ID = t.NODE_ID
+    GROUP BY d.NODE_ID, d.DOW, t.TOTAL_TX
+),
+n3_entropy AS (
+    -- Shannon entropy: −Σ(p × log2(p))
+    -- +1e-12 avoids LOG(2, 0) crash for days with near-zero probability
+    SELECT
+        NODE_ID,
+        -SUM(PROB * LOG(2, PROB + 1E-12))      AS DOW_ENTROPY
+    FROM   dow_probs
+    GROUP BY NODE_ID
+),
+-- ================================================================
+-- SECTION E: N4 — AMOUNT CV  (Coefficient of Variation of sent amounts)
+-- CV near 0 = always same amount (suspicious robotic uniformity)
+-- High CV   = varied amounts    (normal business customer)
+-- Formula: CV = σ / μ on individual sent amounts (population std, ddof=0)
+-- ================================================================
+n4_cv AS (
+    SELECT
+        NODE_ID,
+        AVG(AMOUNT)             AS MU,
+        STDDEV_POP(AMOUNT)      AS SIGMA,   -- population std (matches Python ddof=0)
+        COUNT(*)                AS N_TX
+    FROM   sends
+    WHERE  AMOUNT > 0
+    GROUP BY NODE_ID
+    HAVING COUNT(*) >= 2                    -- need ≥2 sends for CV to be meaningful
+),
+-- ================================================================
+-- SECTION F: N5 — DORMANCY DAYS  (Longest gap between sending dates)
+-- Short gaps = sends regularly (normal)
+-- Long silence + burst = sleeping mule pattern (placement → integration gap)
+-- All monthly-rollup customers show ~30d flat → signal dead without raw data
+-- ================================================================
+distinct_send_dates AS (
+    -- One row per customer per DISTINCT calendar date
+    -- Prevents same-day sends from creating artificial 0-day gaps
+    SELECT DISTINCT NODE_ID, TX_DATE
+    FROM   sends
+),
+date_gaps AS (
+    -- Gap in days between each consecutive sending date per customer
+    -- Oracle DATE − DATE = integer days for TRUNC'd dates
+    SELECT
+        NODE_ID,
+        TX_DATE - LAG(TX_DATE) OVER (PARTITION BY NODE_ID ORDER BY TX_DATE)
+                                          AS GAP_DAYS
+    FROM distinct_send_dates
+),
+n5_dormancy AS (
+    SELECT   NODE_ID, MAX(GAP_DAYS) AS DORMANCY_DAYS
+    FROM     date_gaps
+    WHERE    GAP_DAYS IS NOT NULL          -- first date per customer has no prior → NULL
+    GROUP BY NODE_ID
+    HAVING   COUNT(GAP_DAYS) >= 1          -- at least 2 distinct sending dates
+),
+-- ================================================================
+-- SECTION G: N6 — RELAY RATIO
+-- Fraction of sent money where a prior inbound arrived within 24h
+-- Score 1.0 = pure pass-through (classic money mule / layering account)
+-- Score 0.0 = sends from own funds (normal customer)
+-- Formula: Σ min(send_amt, recv_amt) for matched pairs / total_sent_amt
+--
+-- NOTE: The JOIN can be expensive on large tables.
+--       Add INDEX on (NODE_ID, TX_DATETIME) before running.
+-- ================================================================
+matched_relay AS (
+    -- For each send event: find receive events on the SAME customer within 24h BEFORE
+    -- Oracle: DATE − 1 = exactly 24 hours earlier (1 = 1 day in Oracle DATE arithmetic)
+    SELECT
+        s.NODE_ID,
+        s.AMOUNT                               AS SEND_AMT,
+        LEAST(s.AMOUNT, r.AMOUNT)              AS RELAY_AMT   -- relay = min(sent, received)
+    FROM sends s
+    JOIN recvs r
+      ON  r.NODE_ID     = s.NODE_ID
+      AND r.TX_DATETIME <= s.TX_DATETIME       -- receive happened at or before the send
+      AND r.TX_DATETIME >= s.TX_DATETIME - 1   -- but within 24 hours before (1 day)
+),
+send_totals AS (
+    SELECT NODE_ID, SUM(AMOUNT) AS TOTAL_SENT
+    FROM   sends
+    GROUP BY NODE_ID
+),
+relay_totals AS (
+    SELECT NODE_ID, SUM(RELAY_AMT) AS TOTAL_RELAY
+    FROM   matched_relay
+    GROUP BY NODE_ID
+),
+n6_relay AS (
+    SELECT
+        st.NODE_ID,
+        ROUND(
+            LEAST(
+                NVL(rt.TOTAL_RELAY, 0) / NULLIF(st.TOTAL_SENT, 0),
+                1.0                            -- cap: cannot relay more than you sent
+            ),
+            4
+        )                                      AS RELAY_RATIO
+    FROM   send_totals  st
+    LEFT JOIN relay_totals rt ON st.NODE_ID = rt.NODE_ID
+),
+-- ================================================================
+-- FINAL JOIN: All 6 node columns → one row per customer
+-- All JOINs are LEFT JOIN so customers missing any column get 0 default
+-- ================================================================
+final_nodes AS (
+    SELECT
+        n.NODE_ID       AS CUSTOMER_ID,
+        -- N1: Burstiness — timing irregularity of sends
+        --     Default 0 if < 3 transactions (matches engine default)
+        CASE
+            WHEN b1.SIGMA + b1.MU > 0.000001
+            THEN ROUND((b1.SIGMA - b1.MU) / (b1.SIGMA + b1.MU), 4)
+            ELSE 0
+        END             AS BURSTINESS_B,
+        -- N2: Benford MAD — first-digit law deviation
+        --     Default 0 if < 30 amounts (matches engine threshold)
+        CASE
+            WHEN b2.MAD_RAW IS NOT NULL
+            THEN ROUND(LEAST(b2.MAD_RAW / 0.10, 1.0), 4)
+            ELSE 0
+        END             AS BENFORD_MAD,
+        -- N3: DOW Entropy — day-of-week spread
+        --     Default 0 if < 7 sends (insufficient data for entropy)
+        NVL(ROUND(b3.DOW_ENTROPY, 4), 0)   AS DOW_ENTROPY,
+        -- N4: Amount CV — sent amount variation
+        --     Default 0 if < 2 sends or mean = 0
+        CASE
+            WHEN b4.MU > 0.000001
+            THEN ROUND(b4.SIGMA / b4.MU, 4)
+            ELSE 0
+        END             AS AMOUNT_CV,
+        -- N5: Dormancy — max gap between sending dates
+        --     Default 0 if only 1 distinct sending date
+        NVL(b5.DORMANCY_DAYS, 0)           AS DORMANCY_DAYS,
+        -- N6: Relay ratio — pass-through fraction
+        --     Default 0 if no matched relay events found
+        NVL(b6.RELAY_RATIO, 0)             AS RELAY_RATIO
+    FROM       all_nodes      n
+    LEFT JOIN  n1_burstiness  b1 ON n.NODE_ID = b1.NODE_ID
+    LEFT JOIN  n2_benford     b2 ON n.NODE_ID = b2.NODE_ID
+    LEFT JOIN  n3_entropy     b3 ON n.NODE_ID = b3.NODE_ID
+    LEFT JOIN  n4_cv          b4 ON n.NODE_ID = b4.NODE_ID
+    LEFT JOIN  n5_dormancy    b5 ON n.NODE_ID = b5.NODE_ID
+    LEFT JOIN  n6_relay       b6 ON n.NODE_ID = b6.NODE_ID
+)
+-- ----------------------------------------------------------------
+-- FINAL OUTPUT → save as NODES.CSV for GraphAML
+-- ----------------------------------------------------------------
+SELECT *
+FROM   final_nodes
+ORDER BY CUSTOMER_ID;
+
+Quick Reference — Oracle Functions per Column
+Column	Data Used	Key Oracle Functions	Output File
+Column	Data Used	Key Oracle Functions	Output File
+E1 count_structuring_band	Individual amounts	CASE WHEN amount BETWEEN 8000 AND 9999.99, SUM()	transactions.csv
+E2 min_amount	Individual amounts	MIN(AMOUNT) per group	transactions.csv
+E3 max_amount	Individual amounts	MAX(AMOUNT) per group	transactions.csv
+E4 off_hours_tx_count	Individual timestamps	TO_CHAR(TX_DATETIME, 'HH24'), SUM(IS_OFF_HOURS)	transactions.csv
+E5 round_amount_count	Individual amounts	MOD(AMOUNT, 1000), SUM(IS_ROUND_AMOUNT)	transactions.csv
+E6 recent_tx_count	Timestamps only	CROSS JOIN max_date, DATE − 30	transactions.csv
+E7 baseline_tx_count	Timestamps only	CROSS JOIN max_date, SUM(1 − IS_RECENT)	transactions.csv
+N1 burstiness_b	Send timestamps	LAG(), STDDEV_POP(), DATE − DATE × 86400	nodes.csv
+N2 benford_mad	All amounts (sent + received)	LOG(10, AMOUNT), POWER(), CROSS JOIN benford_expected	nodes.csv
+N3 dow_entropy	Send timestamps	TO_CHAR(TX_DATETIME, 'D'), LOG(2, prob)	nodes.csv
+N4 amount_cv	Send amounts	STDDEV_POP() / AVG()	nodes.csv
+N5 dormancy_days	Send dates	TRUNC(TX_DATETIME), LAG() on distinct dates	nodes.csv
+N6 relay_ratio	Send + receive timestamps + amounts	JOIN with DATE − 1 window, LEAST(), NULLIF()	nodes.csv
+
+Here is the fully reformatted document with all tables properly aligned and all sections consistently styled.
+
+All Compensation Columns — Complete Reference
+What we're building: Two preprocessing scripts that run before GraphAML, using raw individual-level transaction data. They produce extra columns that compensate for signal lost when rolling up to monthly.
+
+Setup — Assumptions
+
+python
+import pandas as pd
+import numpy as np
+# RAW_DF: one row per individual transaction
+# Required columns:
+#   sender_id    → who sent
+#   receiver_id  → who received
+#   amount       → individual transaction amount (NOT a sum)
+#   tx_datetime  → exact timestamp of each transaction
+raw_df['tx_dt']    = pd.to_datetime(raw_df['tx_datetime'])
+raw_df['amount']   = pd.to_numeric(raw_df['amount'], errors='coerce').fillna(0)
+raw_df['tx_hour']  = raw_df['tx_dt'].dt.hour
+raw_df['tx_date']  = raw_df['tx_dt'].dt.date
+# Month key — last day of month (becomes tx_date in the edge rollup)
+raw_df['tx_month'] = raw_df['tx_dt'].dt.to_period('M').dt.to_timestamp('M')
+# All Nov individual rows get tx_month = 2025-11-30
+
+Part 1 — Edge Table Columns (E1–E7)
+Who computes	You, offline, before feeding transactions.csv to GraphAML
+Grain	One row per (sender_id, receiver_id, tx_month) — same as your monthly rollup
+Why needed	Monthly rollup loses information about individual amounts and timing within the month
+
+E1 — count_structuring_band
+What it is: Count of individual transactions between $8,000 and $9,999.99 per pair per month.
+Why needed: Structuring = criminals deliberately keep transactions just under the $10K reporting threshold. After monthly rollup you only see the total ($97,000) — you cannot tell if 10 individual transactions were $9,700 each (structuring) vs one wire of $97,000.
+
+python
+# E1: count_structuring_band
+band = raw_df[(raw_df['amount'] >= 8000) & (raw_df['amount'] <= 9999.99)]
+e1 = (band.groupby(['sender_id', 'receiver_id', 'tx_month'])
+          .size()
+          .reset_index(name='count_structuring_band'))
+
+E2 — min_amount
+What it is: Smallest individual transaction amount for that pair-month.
+Why needed: Monthly sum hides the range. A sum of $50,000 could be one $50K wire (normal) or fifty $1,000 cash deposits (suspicious). Min reveals the smallest individual amount.
+
+python
+# E2: min_amount
+e2 = (raw_df.groupby(['sender_id', 'receiver_id', 'tx_month'])['amount']
+            .min()
+            .reset_index(name='min_amount'))
+
+E3 — max_amount
+What it is: Largest individual transaction amount for that pair-month.
+Why needed: Paired with E2. max_amount − min_amount tells the engine whether this pair uses consistently small amounts (suspicious) or varied amounts (normal business behaviour).
+
+python
+# E3: max_amount
+e3 = (raw_df.groupby(['sender_id', 'receiver_id', 'tx_month'])['amount']
+            .max()
+            .reset_index(name='max_amount'))
+
+E4 — off_hours_tx_count
+What it is: Count of individual transactions sent between 22:00 and 06:59 per pair per month.
+Why needed: The engine calculates off_hours_ratio from tx_hour. In monthly rollup, tx_date is always 2025-11-30 — no time information survives. All rows have no valid tx_hour → dropped → off_hours_ratio = 0.0 for every customer. This column restores the signal.
+
+python
+# E4: off_hours_tx_count
+off = raw_df[(raw_df['tx_hour'] >= 22) | (raw_df['tx_hour'] <= 6)]
+e4 = (off.groupby(['sender_id', 'receiver_id', 'tx_month'])
+         .size()
+         .reset_index(name='off_hours_tx_count'))
+
+E5 — round_amount_count
+What it is: Count of individual transactions where amount % 1000 < 1.0 (divisible by 1,000 within $1 tolerance).
+Why needed: The engine checks amount % 1000 < 1.0 on the monthly sum. Sum of ten $9,700 transactions = $97,000; $97,000 % 1000 = 0 → incorrectly flagged as round. This column pre-counts actually-round individual transactions before summation destroys the signal.
+
+python
+# E5: round_amount_count
+round_tx = raw_df[(raw_df['amount'] % 1000) < 1.0]
+e5 = (round_tx.groupby(['sender_id', 'receiver_id', 'tx_month'])
+              .size()
+              .reset_index(name='round_amount_count'))
+
+E6 — recent_tx_count (monthly only)
+What it is: Count of individual transactions for this pair in the most recent 30 days of your 3-month window (i.e. the November individual transactions).
+Why needed: The engine's velocity score splits tx_df into "recent 30 days" vs "baseline before that". With monthly rollup you have exactly 3 rows (Sep, Oct, Nov). The Nov row has tx_date = 2025-11-30 and days = 1, so velocity rate = tx_count / 1 instead of tx_count / 30. Completely wrong. This column provides the correct recent count.
+
+python
+# E6: recent_tx_count — individuals from the last 30 days of your window
+max_date = raw_df['tx_dt'].max()
+cutoff   = max_date - pd.Timedelta(days=30)
+recent = raw_df[raw_df['tx_dt'] >= cutoff]
+e6 = (recent.groupby(['sender_id', 'receiver_id', 'tx_month'])
+            .size()
+            .reset_index(name='recent_tx_count'))
+
+E7 — baseline_tx_count (monthly only)
+What it is: Count of individual transactions for this pair before the last 30 days (September + most of October).
+Why needed: Paired with E6. Without a baseline the engine returns 0.0 for all velocity scores. With this column the engine patch correctly compares recent vs baseline to detect customers who suddenly ramped up volume in November.
+
+python
+# E7: baseline_tx_count — individuals from before the last 30 days
+baseline = raw_df[raw_df['tx_dt'] < cutoff]
+e7 = (baseline.groupby(['sender_id', 'receiver_id', 'tx_month'])
+              .size()
+              .reset_index(name='baseline_tx_count'))
+
+Complete Edge Compensation Builder
+
+python
+def build_edge_compensation(raw_df):
+    """
+    Takes raw individual transaction dataframe.
+    Returns monthly rolled-up edge table with ALL compensation columns.
+    """
+    df = raw_df.copy()
+    df['tx_dt']    = pd.to_datetime(df['tx_datetime'])
+    df['amount']   = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
+    df['tx_hour']  = df['tx_dt'].dt.hour
+    df['tx_month'] = df['tx_dt'].dt.to_period('M').dt.to_timestamp('M')
+    # --- Base monthly rollup ---
+    base = (df.groupby(['sender_id', 'receiver_id', 'tx_month'])
+              .agg(amount=('amount', 'sum'), tx_count=('amount', 'count'))
+              .reset_index())
+    base.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    # --- E1: structuring band count ---
+    band = df[(df['amount'] >= 8000) & (df['amount'] <= 9999.99)]
+    e1 = (band.groupby(['sender_id', 'receiver_id', 'tx_month'])
+              .size().reset_index(name='count_structuring_band'))
+    e1.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    # --- E2 + E3: min and max individual amounts ---
+    e2e3 = (df.groupby(['sender_id', 'receiver_id', 'tx_month'])['amount']
+               .agg(min_amount='min', max_amount='max')
+               .reset_index())
+    e2e3.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    # --- E4: off-hours transaction count ---
+    off = df[(df['tx_hour'] >= 22) | (df['tx_hour'] <= 6)]
+    e4 = (off.groupby(['sender_id', 'receiver_id', 'tx_month'])
+             .size().reset_index(name='off_hours_tx_count'))
+    e4.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    # --- E5: round amount count ---
+    rnd = df[(df['amount'] % 1000) < 1.0]
+    e5 = (rnd.groupby(['sender_id', 'receiver_id', 'tx_month'])
+             .size().reset_index(name='round_amount_count'))
+    e5.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    # --- E6 + E7: velocity split (monthly only) ---
+    max_dt = df['tx_dt'].max()
+    cutoff = max_dt - pd.Timedelta(days=30)
+    e6 = (df[df['tx_dt'] >= cutoff]
+          .groupby(['sender_id', 'receiver_id', 'tx_month'])
+          .size().reset_index(name='recent_tx_count'))
+    e6.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    e7 = (df[df['tx_dt'] < cutoff]
+          .groupby(['sender_id', 'receiver_id', 'tx_month'])
+          .size().reset_index(name='baseline_tx_count'))
+    e7.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    # --- Merge all together ---
+    key    = ['sender_id', 'receiver_id', 'tx_date']
+    result = base.copy()
+    for extra in [e1, e2e3, e4, e5, e6, e7]:
+        result = result.merge(extra, on=key, how='left')
+    fill_int = ['count_structuring_band', 'off_hours_tx_count',
+                'round_amount_count', 'recent_tx_count', 'baseline_tx_count']
+    result[fill_int]                        = result[fill_int].fillna(0).astype(int)
+    result[['min_amount', 'max_amount']]    = result[['min_amount', 'max_amount']].fillna(0)
+    return result
+# Usage:
+edge_df = build_edge_compensation(raw_df)
+edge_df.to_csv('transactions.csv', index=False)
+
+Part 2 — Node Table Columns (N1–N6)
+Who computes	You, offline, using 90 days of raw individual transactions
+Grain	One row per customer — a stable behavioural fingerprint
+Why needed	The engine's behavioural features read tx_df dates (monthly = 30-day gaps) — all signals become flat and meaningless
+
+N1 — burstiness_b
+What it is: A score from −1 to +1 measuring whether a customer sends money irregularly (+1 = bursty/random) or like clockwork (−1 = robotic/scripted).
+Score	Interpretation	Example
+−1.0	Perfectly equal intervals; σ = 0	Bot sending $9,700 every Monday at 9am
+~0	Normal irregular human cadence	Legitimate customer
+~+1	Long silences then sudden burst activity	Cash dealer; burst laundering
+Formula: B = (σ − μ) / (σ + μ) where σ = std of inter-send gaps (seconds), μ = mean of inter-send gaps.
+
+python
+def compute_burstiness(sender_times_sorted_epoch_seconds):
+    """Input: sorted array of epoch seconds for all sends by this customer."""
+    inter = np.diff(sender_times_sorted_epoch_seconds).astype(float)
+    if len(inter) < 2:
+        return 0.0
+    mu, sigma = inter.mean(), inter.std()
+    denom = sigma + mu
+    return round(float((sigma - mu) / denom), 4) if denom > 1e-9 else 0.0
+
+N2 — benford_mad
+What it is: A score 0 to 1 measuring how abnormal the first digits of a customer's transaction amounts are. Score near 0 = normal (follows Benford's Law). Score near 1 = suspicious.
+First Digit	Benford Expected	Structurer Sending $9,700
+1	30.1%	~0%
+2	17.6%	~0%
+…	…	…
+9	4.6%	~100%
+Formula: MAD = mean(|observed_freq_d − log10(1 + 1/d)|) for digits 1–9 → normalise by 0.10 threshold → clip to 1.0.
+
+python
+BENFORD_EXPECTED = {d: np.log10(1 + 1/d) for d in range(1, 10)}
+def compute_benford_mad(amounts):
+    """Input: array of individual transaction amounts (sent + received) for this customer."""
+    amounts = np.array(amounts)
+    amounts = amounts[amounts > 0.01]
+    if len(amounts) < 30:
+        return 0.0
+    first_digits = (amounts / 10 ** np.floor(np.log10(amounts))).astype(int)
+    first_digits = first_digits[(first_digits >= 1) & (first_digits <= 9)]
+    total = len(first_digits)
+    mad = sum(abs(np.sum(first_digits == d) / total - BENFORD_EXPECTED[d])
+              for d in range(1, 10)) / 9
+    return round(min(mad / 0.10, 1.0), 4)
+
+N3 — dow_entropy
+What it is: A score 0 to 2.807 measuring how spread a customer's sending activity is across days of the week.
+Entropy	Interpretation	Pattern
+2.807 (max)	Perfectly uniform across all 7 days	Legitimate retail customer
+~1.5	Skewed but multi-day	Most normal customers
+~0	All transactions on 1–2 days	Scheduled criminal payment / weekly cash-out
+Formula: H = −Σ p_d × log₂(p_d) for each day d with at least one transaction. Max = log₂(7) = 2.807.
+
+python
+def compute_dow_entropy(sender_datetimes):
+    """Input: array of datetime values for all sends by this customer."""
+    dts = pd.to_datetime(sender_datetimes)
+    if len(dts) < 7:
+        return 0.0
+    dow_probs = dts.dayofweek.value_counts(normalize=True)
+    entropy   = -sum(p * np.log2(p + 1e-12) for p in dow_probs)
+    return round(float(entropy), 4)
+
+N4 — amount_cv
+What it is: Coefficient of Variation of a customer's individual sent amounts. CV = std / mean. Low CV ≈ 0 = suspicious robotic uniformity.
+CV	Interpretation	Example
+~0	All amounts identical	Structurer sending exactly $9,700 every time
+0.5–1.0	Moderate variation	Regular payments with some variation
+>1	High variation	Normal business ($500, $15K, $2,300, $8,900)
+Formula: CV = σ / μ on individual sent amounts (population std, ddof=0).
+
+python
+def compute_amount_cv(sent_amounts):
+    """Input: array of individual sent amounts for this customer."""
+    amounts = np.array(sent_amounts)
+    amounts = amounts[amounts > 0]
+    if len(amounts) < 2:
+        return 0.0
+    mu    = amounts.mean()
+    sigma = amounts.std(ddof=0)
+    return round(float(sigma / mu), 4) if mu > 1e-9 else 0.0
+
+N5 — dormancy_days
+What it is: The longest gap in days between any two consecutive sending dates for this customer over the 90-day window.
+Gap	Interpretation
+< 7 days	Normal (weekends, holidays)
+7–30 days	Occasional pause — common for individuals
+30–90+ days	Sleeping mule pattern — dormant then suddenly activates with large transfers
+Formula: dormancy = max(date[i+1] − date[i]) over all consecutive unique sending dates.
+
+python
+def compute_dormancy_days(sender_datetimes):
+    """Input: array of datetime values for all sends by this customer."""
+    dates = sorted(set(pd.to_datetime(sender_datetimes).dt.date))
+    if len(dates) < 2:
+        return 0
+    gaps = [(dates[i+1] - dates[i]).days for i in range(len(dates) - 1)]
+    return int(max(gaps))
+
+N6 — relay_ratio
+What it is: Fraction of money a customer sends within 24 hours of receiving money. Ratio near 1.0 = pure pass-through relay node. Ratio near 0 = holds own funds.
+Ratio	Interpretation	Pattern
+~1.0	Receives and immediately forwards	Classic money mule / relay agent
+~0.5	Partial relay	Mixed use account
+~0	Sends from own funds with no prior inbound	Normal customer
+Formula: For each outgoing transaction, look back 24 hours for an inbound receive on the same node. relay_ratio = Σ min(send_amt, recv_amt) for matched pairs / total_sent_amt. Clip to [0, 1].
+
+python
+def compute_relay_ratio_all_nodes(raw_df):
+    """
+    Vectorized — computes relay_ratio for ALL customers at once.
+    Input: raw_df with sender_id, receiver_id, tx_datetime, amount.
+    """
+    df          = raw_df.copy()
+    df['tx_dt'] = pd.to_datetime(df['tx_datetime'])
+    df['amount']= pd.to_numeric(df['amount'], errors='coerce').fillna(0)
+    send = (df[['sender_id', 'tx_dt', 'amount']]
+            .rename(columns={'sender_id': '_node', 'amount': '_send_amt'})
+            .sort_values('tx_dt').reset_index(drop=True))
+    recv = (df[['receiver_id', 'tx_dt', 'amount']]
+            .rename(columns={'receiver_id': '_node', 'amount': '_recv_amt'})
+            .sort_values('tx_dt').reset_index(drop=True))
+    matched = pd.merge_asof(
+        send, recv,
+        on='tx_dt', by='_node',
+        tolerance=pd.Timedelta(hours=24),
+        direction='backward'
+    )
+    matched_valid = matched.dropna(subset=['_recv_amt']).copy()
+    total_sent = send.groupby('_node')['_send_amt'].sum()
+    if matched_valid.empty:
+        relay = pd.Series(0.0, index=total_sent.index)
+    else:
+        matched_valid['_relay_amt'] = matched_valid[['_send_amt', '_recv_amt']].min(axis=1)
+        relay_sent = matched_valid.groupby('_node')['_relay_amt'].sum()
+        relay = (relay_sent.reindex(total_sent.index, fill_value=0.0)
+                           / total_sent.replace(0, np.nan)
+                 ).fillna(0.0).clip(0.0, 1.0).round(4)
+    return relay.reset_index().rename(columns={'_node': 'customer_id', 0: 'relay_ratio'})
+
+Complete Node Profile Builder
+
+python
+def build_node_profiles(raw_df):
+    """
+    Takes raw individual transaction dataframe (90-day window).
+    Returns nodes.csv with one row per customer and N1–N6 columns.
+    """
+    df           = raw_df.copy()
+    df['tx_dt']  = pd.to_datetime(df['tx_datetime'])
+    df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
+    all_customers = sorted(
+        set(df['sender_id'].unique()) | set(df['receiver_id'].unique())
+    )
+    records = []
+    for cust in all_customers:
+        sent = df[df['sender_id'] == cust]
+        both_amounts = pd.concat([
+            df[df['sender_id']   == cust]['amount'],
+            df[df['receiver_id'] == cust]['amount']
+        ])
+        row = {'customer_id': cust}
+        # N1 — burstiness_b
+        if len(sent) >= 3:
+            times = np.sort(sent['tx_dt'].astype('int64').values) // 10**9
+            inter = np.diff(times).astype(float)
+            if len(inter) >= 2:
+                mu, sigma = inter.mean(), inter.std()
+                row['burstiness_b'] = round((sigma - mu) / (sigma + mu), 4) if (sigma + mu) > 1e-9 else 0.0
+            else:
+                row['burstiness_b'] = 0.0
+        else:
+            row['burstiness_b'] = 0.0
+        # N2 — benford_mad
+        amts = both_amounts[both_amounts > 0.01].values
+        if len(amts) >= 30:
+            fd    = (amts / 10 ** np.floor(np.log10(amts))).astype(int)
+            fd    = fd[(fd >= 1) & (fd <= 9)]
+            total = len(fd)
+            mad   = sum(abs(np.sum(fd == d) / total - np.log10(1 + 1/d)) for d in range(1, 10)) / 9
+            row['benford_mad'] = round(min(mad / 0.10, 1.0), 4)
+        else:
+            row['benford_mad'] = 0.0
+        # N3 — dow_entropy
+        if len(sent) >= 7:
+            probs = sent['tx_dt'].dt.dayofweek.value_counts(normalize=True)
+            row['dow_entropy'] = round(float(-sum(p * np.log2(p + 1e-12) for p in probs)), 4)
+        else:
+            row['dow_entropy'] = 0.0
+        # N4 — amount_cv
+        sa = sent['amount'][sent['amount'] > 0].values
+        if len(sa) >= 2:
+            mu_a = sa.mean()
+            row['amount_cv'] = round(sa.std(ddof=0) / mu_a, 4) if mu_a > 1e-9 else 0.0
+        else:
+            row['amount_cv'] = 0.0
+        # N5 — dormancy_days
+        dates = sorted(set(sent['tx_dt'].dt.date))
+        row['dormancy_days'] = max(
+            ((dates[i+1] - dates[i]).days for i in range(len(dates) - 1)), default=0
+        ) if len(dates) >= 2 else 0
+        records.append(row)
+    # N6 — relay_ratio (vectorized for all nodes at once)
+    relay_df = compute_relay_ratio_all_nodes(raw_df)
+    node_df  = pd.DataFrame(records)
+    node_df  = node_df.merge(relay_df, on='customer_id', how='left')
+    node_df['relay_ratio'] = node_df['relay_ratio'].fillna(0.0)
+    return node_df
+# Usage:
+node_df = build_node_profiles(raw_df)
+node_df.to_csv('nodes.csv', index=False)
+
+Summary — What Each Column Fixes
+#	Column	Table	Engine Feature Restored	Failure Without It	Min Data Required
+#	Column	Table	Engine Feature Restored	Failure Without It	Min Data Required
+E1	count_structuring_band	Edge	structuring_score Tier 1	Falls to unit-amount proxy; false negatives on split structuring	1 txn in $8K–$10K range
+E2	min_amount	Edge	structuring_score Tier 2	No range info; Tier 3 fallback without E3 pair	1 txn
+E3	max_amount	Edge	structuring_score Tier 2	No range info; Tier 3 fallback without E2 pair	1 txn
+E4	off_hours_tx_count	Edge	off_hours_ratio	off_hours_ratio = 0.0 for ALL nodes — no tx_hour in rollup	1 off-hours txn
+E5	round_amount_count	Edge	round_amount_rate	Round-amount check on monthly sum gives wrong result	1 round txn
+E6	recent_tx_count	Edge	velocity_delta_z	Velocity rate = tx_count / 1 day instead of / 30	Monthly only
+E7	baseline_tx_count	Edge	velocity_delta_z	Baseline empty → all velocity scores = 0.0	Monthly only
+N1	burstiness_b	Node	goh_barabasi_b	Period dates = identical gaps → B = −1 for everyone	3 sends
+N2	benford_mad	Node	benford_mad	Period sums destroy first-digit law; < 30 threshold fails	30 txns
+N3	dow_entropy	Node	dow_entropy	Monthly date = same DOW for all → entropy identical across all nodes	7 sends
+N4	amount_cv	Node	amount_cv	CV of 3 monthly sums ≠ CV of 60+ individual amounts — semantically wrong	2 sends
+N5	dormancy_days	Node	dormancy_days	All monthly gaps ≈ 30d for every active customer — signal flat	2 send dates
+N6	relay_ratio	Node	relay_score	All monthly rows same date → relay = 1.0 for every node	1 send + 1 recv
+
+
+Here is the fully reformatted content with all tables in proper aligned markdown.arxiv
+
+Edge-Level Columns
+Added to tx_df per (sender_id, receiver_id, period).
+Computed from individual raw transactions before rollup aggregation.
+#	Column Name	Type	Weekly	Monthly	Engine Feature Fixed	Derivation Logic (from raw individual rows)
+E1	count_structuring_band	int	✅	✅	structuring_score — unlocks Tier 1 exact path	SUM(1 WHERE amount >= 8000 AND amount <= 9999.99) per (sender_id, receiver_id, period)
+E2	min_amount	float	✅	✅	structuring_score — unlocks Tier 2 interpolation	MIN(amount) per (sender_id, receiver_id, period)
+E3	max_amount	float	✅	✅	structuring_score — unlocks Tier 2 interpolation	MAX(amount) per (sender_id, receiver_id, period)
+E4	off_hours_tx_count	int	✅	✅	off_hours_ratio — engine reads tx_hour per row; rolled-up row has no valid tx_hour	SUM(1 WHERE tx_hour >= 22 OR tx_hour <= 6) per (sender_id, receiver_id, period)
+E5	round_amount_count	int	✅	✅	round_amount_rate — engine applies amount % 1000 < 1 on period SUM which is wrong	SUM(1 WHERE individual_amount % 1000 < 1) per (sender_id, receiver_id, period)
+E6	recent_tx_count	int	❌	✅	velocity_delta_z — baseline.empty silent 0.0 for all nodes (confirmed flow.py:507)	SUM(tx_count WHERE daily_date >= month_end_date − 30 days) per (sender_id, receiver_id, month)
+E7	baseline_tx_count	int	❌	✅	velocity_delta_z — paired with E6 to bypass date-cutoff split	SUM(tx_count WHERE daily_date < month_end_date − 30 days) per (sender_id, receiver_id, month)
+	Totals: Weekly = 5 edge columns (E1–E5) · Monthly = 7 edge columns (E1–E7)
+
+Node-Level Columns
+Added to nodes_df per customer_id.
+Computed once from all individual raw transactions before any rollup. Same file goes into nodes.csv.
+#	Column Name	Type	Weekly	Monthly	Engine Feature Fixed	Derivation Logic (from raw individual transactions)
+N1	burstiness_b	float −1 to +1	✅	✅	goh_barabasi_b — weekly tx_df gives 1 timestamp/period → all inter-events = 7d → σ=0 → B=−1 for all	Per customer: sort all sent tx_timestamp → inter = np.diff(epoch_seconds) → B = (σ−μ)/(σ+μ). Min 3 transactions; return 0.0 if fewer
+N2	benford_mad	float 0 to 1	✅	✅	benford_mad — engine iterates tx_df["amount"] which are period SUMs, not individual amounts; first-digit law breaks on sums	Per customer: collect all individual sent+received amount >= 0.01 → extract leading digit → MAD = mean(|observed_freq − benford_freq|)
+N3	dow_entropy	float 0 to 2.807	✅	✅	dow_entropy — engine reads tx_date.dt.dayofweek from tx_df; week rollup sets all dates to Monday → DOW=0 always → entropy=0 for all	Per customer: extract dayofweek from all individual sent tx_timestamp → H = −Σ p_d · log₂(p_d) for d∈{0..6}. Min 7 transactions
+N4	amount_cv	float ≥ 0	✅	✅	amount_cv — engine computes std/mean of period SUM amounts; CV(sums) ≠ CV(individual amounts) — semantically wrong	Per customer: collect all individual sent amount → CV = std(amounts) / mean(amounts). Min 2 transactions
+N5	dormancy_days	float	⚠️ optional	✅	dormancy_days — monthly period dates are 1st of month; all active months show ~30d gap → signal is flat for all	Per customer: sort unique individual sent tx_date → max_gap = max([(dates[i+1] − dates[i]).days]). Returns 0.0 if fewer than 2 dates
+N6	relay_ratio	float 0 to 1	❌	✅ CRITICAL	relay_score — monthly all rows have _date=2024-01-01; merge_asof(tolerance=24h) matches ALL events → relay=1.0 for every node (confirmed flow.py:538)	Per customer: pd.merge_asof(send_raw, recv_raw, on="tx_timestamp", by="node", tolerance=Timedelta(hours=24), direction="backward") on raw data → relay_ratio = matched_sent_amount / total_sent_amount
+	Totals: Weekly = 4 node columns (N1–N4) · Monthly = 6 node columns (N1–N6)
+
+Grand Summary
+Level	Column	Weekly	Monthly
+Level	Column	Weekly	Monthly
+EDGE	count_structuring_band	✅	✅
+EDGE	min_amount	✅	✅
+EDGE	max_amount	✅	✅
+EDGE	off_hours_tx_count	✅	✅
+EDGE	round_amount_count	✅	✅
+EDGE	recent_tx_count	❌	✅
+EDGE	baseline_tx_count	❌	✅
+NODE	burstiness_b	✅	✅
+NODE	benford_mad	✅	✅
+NODE	dow_entropy	✅	✅
+NODE	amount_cv	✅	✅
+NODE	dormancy_days	⚠️ optional	✅
+NODE	relay_ratio	❌	✅
+	TOTAL NEW COLUMNS	9	13
+All 9 weekly columns are a strict subset of the 13 monthly columns. The 4 monthly-only columns (recent_tx_count, baseline_tx_count, dormancy_days, relay_ratio) recover two engine features that completely collapse to 0.0 at monthly granularity without them.
+
+From <https://www.perplexity.ai/?login-source=floatingSignup&login-new=false> 
+
+Here is the fully reformatted document with proper markdown table alignment throughout.
+
+Edge-Level Columns — transactions.csv per (sender_id, receiver_id, period)
+Computed from raw individual transaction rows BEFORE rollup aggregation.
+The app will not crash without any of these — all failures are silent degradation.
+#	Column	Type	If Missing → Engine Behaviour	Impact	Derivation Logic (raw individual rows)
+E1	count_structuring_band	int	Falls to Tier 3: uses amount / tx_count as unit-amount proxy. $9700 + $500 = $10200 / 2 = $5100 — not flagged. False negatives on split structuring.	🟠 MEDIUM	Per (sender_id, receiver_id, period): SUM(1 WHERE individual_amount >= 8000 AND individual_amount <= 9999.99)
+E2	min_amount	float	Without E1 + E2 + E3 together → Tier 3 fallback. E2 alone without E3 still = Tier 3. Both E2 + E3 must be present to activate Tier 2 overlap interpolation.	🟠 MEDIUM	Per (sender_id, receiver_id, period): MIN(individual_amount)
+E3	max_amount	float	Same as E2 — must pair with E2 to unlock Tier 2 overlap interpolation in structuring engine.	🟠 MEDIUM	Per (sender_id, receiver_id, period): MAX(individual_amount)
+E4	off_hours_tx_count	int	Engine reads tx_hour per rollup row, drops NaN. Rolled-up row has no valid single tx_hour (aggregated as median). All NaN → dropped → off_hours_ratio = 0.0 for ALL nodes. Off-hours detection fully disabled.	🟡 HIGH	Per (sender_id, receiver_id, period): SUM(1 WHERE tx_hour >= 22 OR tx_hour <= 6) on each individual raw row before rollup
+E5	round_amount_count	int	Engine applies amount % 1000 < 1 on period SUM amounts. $9700 + $9800 = $19500; $19500 % 1000 = 500 → not flagged. Round-amount structuring signal partially destroyed.	🟠 MEDIUM	Per (sender_id, receiver_id, period): SUM(1 WHERE individual_amount % 1000 < 1.0)
+E6	recent_tx_count	int	Engine splits by cutoff = max_date − 30 days. Monthly tx_df has few rows per pair → baseline window often empty → silent return 0.0 for ALL senders (confirmed flow.py:507). velocity_delta_z feature fully disabled.	🟡 HIGH	Per (sender_id, receiver_id, month): SUM(tx_count WHERE daily_tx_date >= month_end_date − 30 days)
+E7	baseline_tx_count	int	Paired with E6. Without it, engine uses empty baseline → all velocity deltas = 0.0 for every node regardless of actual activity change.	🟡 HIGH	Per (sender_id, receiver_id, month): SUM(tx_count WHERE daily_tx_date < month_end_date − 30 days)
+	Totals: Weekly = 5 edge columns (E1–E5) · Monthly = 7 edge columns (E1–E7)
+
+Node-Level Columns — nodes.csv per customer_id
+How to compute: Run a Python script offline on your raw transaction table (before any rollup). Compute one scalar per customer_id and add as a column to nodes.csv. The engine reads it as a node attribute at Phase 0 load time. Engine patches P1–P5 are required to make the engine consume these pre-computed values instead of recomputing from the (wrong) rolled-up tx_df.
+#	Column	Type	If Missing → Engine Behaviour	Impact	Derivation Logic (raw individual transactions)
+N1	burstiness_b	float −1 to +1	Engine reads timestamps from rolled-up tx_df. Sender with 5 counterparties → 5 rows per period, all same week-start date. np.diff() produces mix of artificial 0-gaps (same-date, different-receiver rows) and real 7-day weekly jumps. Signal is a random artefact, not behavioural burstiness.	🟡 HIGH	Source: raw tx_timestamp for each sender_id. (1) Sort timestamps ascending in epoch seconds. (2) inter = np.diff(epoch_seconds). (3) mu = inter.mean(), sigma = inter.std(). (4) B = (sigma − mu) / (sigma + mu) if sigma + mu > 1e-9 else 0.0. (5) Round to 4 dp. Min: 3 individual transactions; return 0.0 if fewer.
+N2	benford_mad	float 0 to 1	Engine iterates tx_df["amount"] per node — these are period SUM amounts. 10 × $9,700/day = $67,900 weekly → leading digit "6", not "9". First-digit structuring signal completely destroyed by summation.	🟡 HIGH	Source: raw individual amount (sent + received) per customer_id. (1) Collect all amount >= 0.01. (2) Extract leading digit d ∈ {1..9}: shift sub-unit amounts via amt × 10^ceil(−log10(amt)) if amt < 1, then int(str(int(amt))[0]). (3) obs[d] = count(digit == d) / total_count. (4) exp[d] = log10(1 + 1/d) for d = 1..9. (5) MAD = mean(|obs[d] − exp[d]|). (6) score = min(MAD / 0.10, 1.0). Min: 30 individual amounts; return 0.0 if fewer.
+N3	dow_entropy	float 0 to 2.807	Engine reads tx_date.dt.dayofweek from rolled-up tx_df. Weekly rollup sets all tx_date = Monday (DOW=0) → dow_counts = {0: all_rows} → entropy = 0.0 for EVERY node. Feature completely zeroed across the entire dataset.	🟡 HIGH	Source: raw tx_timestamp for each sender_id. (1) Extract dayofweek (0=Mon..6=Sun) from each individual sent timestamp. (2) counts[d] for d ∈ {0..6}. (3) probs[d] = counts[d] / sum(counts). (4) H = −sum(probs[d] × log2(probs[d] + 1e-12) for d in {0..6}). (5) Round to 4 dp. Max = log2(7) = 2.807 (uniform). Min: 7 individual sent transactions.
+N4	amount_cv	float ≥ 0	Engine computes std(amts) / mean(amts) where amts = period-sum amounts in sender's tx_df rows. CV(period sums) ≠ CV(individual amounts). Structurer sending exactly $9,700/day → weekly sum = $67,900 every week → std = 0, CV = 0. Looks identical to a legitimate salaried customer — semantically reversed.	🟠 MEDIUM	Source: raw individual sent amount per sender_id. (1) Collect all individual sent amounts. (2) mu = mean(amounts). (3) CV = std(amounts, ddof=0) / max(mu, 1e-9). (4) Round to 4 dp. Min: 2 individual sent transactions; return 0.0 if fewer.
+N5	dormancy_days	float	Engine computes max gap between consecutive dates in tx_df. Monthly rollup: sender's rows all have tx_date = 1st of month. Sorted: [Jan 1, Jan 1, Feb 1, Feb 1, ...]. Max gap for a continuously active sender = 28–31 days always. All active customers show ~30d dormancy — true 90-day dormants are indistinguishable from monthly-active customers.	🟡 HIGH (monthly)	Source: raw individual tx_date per sender_id. (1) Collect all unique calendar dates with sent transactions. (2) Sort ascending. (3) gaps = [(dates[i+1] − dates[i]).days for i in range(len − 1)]. (4) dormancy_days = max(gaps). Return 0.0 if fewer than 2 distinct dates. No normalisation — raw days value.
+N6	relay_ratio	float 0 to 1	Engine runs pd.merge_asof(tolerance=Timedelta(hours=24), direction="backward") on tx_df dates. Monthly rollup: ALL January rows have _date = 2024-01-01. Every send event matches every receive event (same date, 0h < 24h tolerance). relay_score = 1.0 for literally every node (confirmed flow.py:538). Entire customer base falsely flagged as relay agents.	🔴 CRITICAL (monthly)	Source: raw tx_timestamp for all transactions (send + receive). (1) send_raw = {node=sender_id, tx_timestamp, amount}. recv_raw = {node=receiver_id, tx_timestamp, amount}. (2) Sort both by tx_timestamp. (3) matched = pd.merge_asof(send_raw, recv_raw, on="tx_timestamp", by="node", tolerance=Timedelta(hours=24), direction="backward"). (4) relay_ratio[node] = sum(matched_send_amount) / sum(total_send_amount). Return 0.0 if no sends. Clip to [0, 1].
+	Totals: Weekly = 4 node columns (N1–N4) · Monthly = 6 node columns (N1–N6)
+
+Grand Summary — All 13 Columns
+Level	#	Column	Weekly	Monthly	Failure Mode Without It
+Level	#	Column	Weekly	Monthly	Failure Mode Without It
+EDGE	E1	count_structuring_band	✅	✅	Tier 3 fallback; false negatives on split structuring
+EDGE	E2	min_amount	✅	✅	Tier 3 fallback without E3 pair
+EDGE	E3	max_amount	✅	✅	Tier 3 fallback without E2 pair
+EDGE	E4	off_hours_tx_count	✅	✅	off_hours_ratio = 0.0 for all nodes
+EDGE	E5	round_amount_count	✅	✅	Round-amount structuring signal partially destroyed
+EDGE	E6	recent_tx_count	❌	✅	velocity_delta_z = 0.0 for all senders (flow.py:507)
+EDGE	E7	baseline_tx_count	❌	✅	All velocity deltas = 0.0 — no activity change detection
+NODE	N1	burstiness_b	✅	✅	B = −1 artefact for all weekly nodes
+NODE	N2	benford_mad	✅	✅	First-digit signal destroyed by period summation
+NODE	N3	dow_entropy	✅	✅	entropy = 0.0 for every node on weekly rollup
+NODE	N4	amount_cv	✅	✅	CV of sums ≠ CV of individual amounts — signal reversed
+NODE	N5	dormancy_days	⚠️ optional	✅	All active customers show flat ~30d gap on monthly rollup
+NODE	N6	relay_ratio	❌	✅	relay_score = 1.0 for every node (flow.py:538)
+		TOTAL	9	13	
+All 9 weekly columns are a strict subset of the 13 monthly columns. The 4 monthly-only columns (recent_tx_count, baseline_tx_count, dormancy_days, relay_ratio) recover two features that collapse entirely to 0.0 at monthly granularity without them.
+
+From <https://www.perplexity.ai/search/make-proper-format-stage-1-see-ii6XXruyTmaxQiIazjAreQ?sm=d> 
+
+
+Here is the fully reformatted document with all sections in consistent, clean markdown.oracle+1
+
+Node Feature SQL Reference
+Source table: RAW_TRANSACTIONS(SENDER_ID, RECEIVER_ID, AMOUNT, TX_DATETIME DATE)
+All 6 queries run against this single table. Output grain = 1 row per SENDER_ID (or cust_id). Results are joined and loaded into nodes.csv.
+
+N1 — burstiness_b
+What it measures: The rhythm of a customer's sending activity.
+Score	Meaning	Typical Source
+Near −1	Perfectly equal intervals (e.g. every Tuesday 9am)	Bot / scripted mule
+Near 0	Normal irregular human pattern	Legitimate customer
+Near +1	Silent for weeks, then 20 transactions in one day	Cash dealer / burst laundering
+Formula: Sort all send timestamps → compute consecutive gaps in seconds → B = (σ − μ) / (σ + μ)oracle-base
+
+sql
+WITH gaps AS (
+    SELECT
+        sender_id,
+        (  TX_DATETIME
+         - LAG(TX_DATETIME) OVER (PARTITION BY sender_id ORDER BY TX_DATETIME)
+        ) * 86400  AS gap_seconds   -- DATE subtraction = days; ×86400 = seconds
+    FROM RAW_TRANSACTIONS
+),
+stats AS (
+    SELECT
+        sender_id,
+        COUNT(*)                AS n,
+        AVG(gap_seconds)        AS mu,
+        STDDEV_POP(gap_seconds) AS sigma   -- population std, matches Python np.std()
+    FROM gaps
+    WHERE gap_seconds IS NOT NULL
+    GROUP BY sender_id
+    HAVING COUNT(*) >= 2                   -- ≥3 transactions = ≥2 gaps
+)
+SELECT
+    sender_id AS cust_id,
+    CASE
+        WHEN (sigma + mu) > 0.000001
+        THEN ROUND((sigma - mu) / (sigma + mu), 4)
+        ELSE 0
+    END       AS burstiness_b
+FROM stats;
+
+N2 — benford_mad
+What it measures: How much the customer's transaction amounts deviate from Benford's Law.
+Benford's Expected First-Digit Distribution	
+Digit "1"	~30.1%
+Digit "2"	~17.6%
+…	…
+Digit "9"	~4.6%
+A structurer always sending $9,700–$9,900 → digit "9" appears 80–90% vs expected 4.6% → high score. Normal customers score near 0.
+Formula: Collect all individual amounts (sent + received) → extract leading digit → compare observed vs Benford expected → MAD = mean(|obs − exp|) normalised to [0, 1].
+
+sql
+WITH all_amounts AS (
+    SELECT sender_id   AS cust_id, amount FROM RAW_TRANSACTIONS WHERE amount >= 0.01
+    UNION ALL
+    SELECT receiver_id AS cust_id, amount FROM RAW_TRANSACTIONS WHERE amount >= 0.01
+),
+with_digit AS (
+    SELECT
+        cust_id,
+        -- Extract first significant digit: 9700→9, 0.97→9, 123→1
+        FLOOR( amount / POWER(10, FLOOR(LOG(10, amount))) )  AS first_digit
+    FROM all_amounts
+    WHERE amount >= 0.01
+),
+cust_totals AS (
+    SELECT cust_id, COUNT(*) AS total_count
+    FROM with_digit
+    WHERE first_digit BETWEEN 1 AND 9
+    GROUP BY cust_id
+    HAVING COUNT(*) >= 30      -- min 30 amounts for reliable estimate
+),
+benford_ref AS (
+    SELECT 1 AS d, 0.30103 AS expected FROM DUAL UNION ALL
+    SELECT 2,      0.17609            FROM DUAL UNION ALL
+    SELECT 3,      0.12494            FROM DUAL UNION ALL
+    SELECT 4,      0.09691            FROM DUAL UNION ALL
+    SELECT 5,      0.07918            FROM DUAL UNION ALL
+    SELECT 6,      0.06695            FROM DUAL UNION ALL
+    SELECT 7,      0.05799            FROM DUAL UNION ALL
+    SELECT 8,      0.05115            FROM DUAL UNION ALL
+    SELECT 9,      0.04576            FROM DUAL
+),
+all_combos AS (
+    -- Every customer × every digit 1–9 (missing digits count as 0 observed)
+    SELECT ct.cust_id, br.d, br.expected, ct.total_count
+    FROM cust_totals ct CROSS JOIN benford_ref br
+),
+digit_observed AS (
+    SELECT cust_id, first_digit, COUNT(*) AS cnt
+    FROM with_digit
+    WHERE first_digit BETWEEN 1 AND 9
+    GROUP BY cust_id, first_digit
+),
+abs_diffs AS (
+    SELECT
+        ac.cust_id,
+        ABS(  NVL(do.cnt, 0) / ac.total_count   -- observed freq (0 if digit never appeared)
+            - ac.expected )                      -- minus Benford expected
+        AS abs_diff
+    FROM all_combos ac
+    LEFT JOIN digit_observed do
+           ON ac.cust_id = do.cust_id AND ac.d = do.first_digit
+)
+SELECT
+    cust_id,
+    ROUND( LEAST( AVG(abs_diff) / 0.10, 1.0 ), 6 )  AS benford_mad
+    -- AVG over 9 digits = MAD; /0.10 normalises; LEAST clips to 1.0 max
+FROM abs_diffs
+GROUP BY cust_id;
+
+N3 — dow_entropy
+What it measures: Whether a customer sends money spread across all 7 days or concentrated on specific days.
+Entropy Value	Meaning	Pattern
+2.807 (max)	Perfectly uniform across all 7 days	Legitimate retail customer
+~0	All transactions on 1 day only	Weekly cash-out / scheduled criminal payment
+Formula: Count transactions per day of week → convert to proportions → Shannon entropy −Σ p × log₂(p).
+
+sql
+WITH tx_with_dow AS (
+    SELECT
+        sender_id,
+        TO_CHAR(TX_DATETIME, 'D')  AS day_of_week   -- 1=Sun..7=Sat (Oracle NLS default)
+    FROM RAW_TRANSACTIONS
+),
+dow_counts AS (
+    SELECT sender_id, day_of_week, COUNT(*) AS cnt
+    FROM tx_with_dow
+    GROUP BY sender_id, day_of_week
+),
+cust_totals AS (
+    SELECT sender_id, SUM(cnt) AS total_tx
+    FROM dow_counts
+    GROUP BY sender_id
+    HAVING SUM(cnt) >= 7         -- ≥7 transactions for meaningful result
+),
+with_prob AS (
+    SELECT
+        dc.sender_id,
+        dc.cnt / ct.total_tx  AS prob
+    FROM dow_counts dc
+    JOIN cust_totals ct ON dc.sender_id = ct.sender_id
+)
+SELECT
+    sender_id                                                    AS cust_id,
+    ROUND( -SUM( prob * LOG(2, prob + 0.000000000001) ), 4 )    AS dow_entropy
+    -- +1e-12 inside LOG avoids LOG(0) crash when prob is effectively 0
+FROM with_prob
+GROUP BY sender_id;
+
+N4 — amount_cv
+What it measures: How much this customer's individual payment amounts vary. Low CV = suspicious uniformity.
+CV Value	Meaning	Typical Pattern
+~0	All amounts identical	Structurer sending exactly $9,700 every time
+>1	High variation	Normal business ($500, $12K, $340, $8,900)
+Formula: All individual sent amounts → CV = std / mean.
+
+sql
+SELECT
+    sender_id  AS cust_id,
+    CASE
+        WHEN AVG(amount) > 0.000001
+        THEN ROUND( STDDEV_POP(amount) / AVG(amount), 4 )
+        ELSE 0
+    END        AS amount_cv
+FROM RAW_TRANSACTIONS
+WHERE amount > 0
+GROUP BY sender_id
+HAVING COUNT(*) >= 2;          -- ≥2 transactions for meaningful std
+
+N5 — dormancy_days
+What it measures: The longest gap (in days) a customer went completely silent on outgoing transactions.
+Gap	Meaning
+<7 days	Normal (weekends, holidays)
+30–90+ days	Sleeping mule pattern — dormant then suddenly activates with large transfers
+Formula: All unique sending dates → sort → max(gap between consecutive dates).
+
+sql
+WITH unique_dates AS (
+    -- Collapse same-day activity to one row per date per customer
+    SELECT DISTINCT sender_id, TRUNC(TX_DATETIME) AS tx_date
+    FROM RAW_TRANSACTIONS
+),
+with_prev AS (
+    SELECT
+        sender_id,
+        tx_date,
+        LAG(tx_date) OVER (PARTITION BY sender_id ORDER BY tx_date)  AS prev_date
+    FROM unique_dates
+),
+gaps AS (
+    SELECT
+        sender_id,
+        tx_date - prev_date  AS gap_days    -- Oracle DATE subtraction returns NUMBER (days)
+    FROM with_prev
+    WHERE prev_date IS NOT NULL
+)
+SELECT
+    sender_id     AS cust_id,
+    MAX(gap_days) AS dormancy_days
+FROM gaps
+GROUP BY sender_id;
+-- Returns NULL for customers with only 1 distinct sending date → treat as 0 in nodes.csv
+
+N6 — relay_ratio
+What it measures: What fraction of the money this customer sent had a matching inbound payment arrive within 24 hours before it — the classic pass-through mule pattern.
+Ratio	Meaning
+~1.0	Receives and immediately forwards — pure relay agent
+~0.0	Sends from own funds — no inbound match
+Formula: For each outgoing transaction, look back 24 hours for an inbound receive on the same customer. relay_ratio = matched sent amount / total sent amount.oracle
+
+sql
+WITH sends AS (
+    SELECT
+        sender_id   AS node_id,
+        TX_DATETIME AS send_time,
+        amount      AS send_amount,
+        ROW_NUMBER() OVER (
+            PARTITION BY sender_id ORDER BY TX_DATETIME, ROWNUM
+        )           AS send_rn
+    FROM RAW_TRANSACTIONS
+),
+receives AS (
+    SELECT
+        receiver_id  AS node_id,
+        TX_DATETIME  AS recv_time,
+        amount       AS recv_amount
+    FROM RAW_TRANSACTIONS
+),
+matched AS (
+    -- For each send event: find receives on the SAME customer within prior 24 hours
+    SELECT
+        s.node_id,
+        s.send_rn,
+        s.send_amount,
+        r.recv_amount,
+        -- Rank receives newest-first to pick the most recent one (matches merge_asof)
+        ROW_NUMBER() OVER (
+            PARTITION BY s.node_id, s.send_rn
+            ORDER BY r.recv_time DESC
+        ) AS match_rank
+    FROM sends s
+    JOIN receives r
+      ON  s.node_id    = r.node_id
+      AND r.recv_time <= s.send_time              -- received BEFORE the send
+      AND r.recv_time >= s.send_time - (1/24)     -- within 24 hours (1/24 of a day)
+),
+best_match AS (
+    SELECT
+        node_id,
+        send_amount,
+        LEAST(send_amount, recv_amount)  AS relay_amount   -- relay = smaller of the two
+    FROM matched
+    WHERE match_rank = 1
+),
+relay_totals AS (
+    SELECT node_id, SUM(relay_amount) AS total_relayed
+    FROM best_match
+    GROUP BY node_id
+),
+send_totals AS (
+    SELECT sender_id AS node_id, SUM(amount) AS total_sent
+    FROM RAW_TRANSACTIONS
+    GROUP BY sender_id
+)
+SELECT
+    st.node_id  AS cust_id,
+    CASE
+        WHEN st.total_sent > 0
+        THEN ROUND( LEAST( NVL(rt.total_relayed, 0) / st.total_sent, 1 ), 4 )
+        ELSE 0
+    END         AS relay_ratio
+FROM send_totals      st
+LEFT JOIN relay_totals rt ON st.node_id = rt.node_id;
+
+Quick Reference — All 6 Node Feature SQLs
+#	Column	Source Transactions	Grain	Min Rows Required	Output File
+#	Column	Source Transactions	Grain	Min Rows Required	Output File
+N1	burstiness_b	Sent only	1 row per SENDER_ID	≥ 3 transactions	nodes.csv
+N2	benford_mad	Sent + received	1 row per cust_id	≥ 30 amounts	nodes.csv
+N3	dow_entropy	Sent only	1 row per SENDER_ID	≥ 7 transactions	nodes.csv
+N4	amount_cv	Sent only	1 row per SENDER_ID	≥ 2 transactions	nodes.csv
+N5	dormancy_days	Sent only	1 row per SENDER_ID	≥ 2 distinct dates	nodes.csv
+N6	relay_ratio	Sent + received	1 row per SENDER_ID	≥ 1 send transaction	nodes.csv
+	Assembly: Run all 6 queries → join on cust_id → LEFT JOIN onto your existing nodes.csv. Customers with no outgoing transactions receive NULL → replace with 0 before saving.
+
+From <https://www.perplexity.ai/search/make-proper-format-stage-1-see-ii6XXruyTmaxQiIazjAreQ?sm=d> 
+
+
+Here is the fully reformatted document with all tables properly aligned and all sections consistently styled.
+
+All Compensation Columns — Complete Reference
+What we're building: Two preprocessing scripts that run before GraphAML, using raw individual-level transaction data. They produce extra columns that compensate for signal lost when rolling up to monthly.
+
+Setup — Assumptions
+
+python
+import pandas as pd
+import numpy as np
+# RAW_DF: one row per individual transaction
+# Required columns:
+#   sender_id    → who sent
+#   receiver_id  → who received
+#   amount       → individual transaction amount (NOT a sum)
+#   tx_datetime  → exact timestamp of each transaction
+raw_df['tx_dt']    = pd.to_datetime(raw_df['tx_datetime'])
+raw_df['amount']   = pd.to_numeric(raw_df['amount'], errors='coerce').fillna(0)
+raw_df['tx_hour']  = raw_df['tx_dt'].dt.hour
+raw_df['tx_date']  = raw_df['tx_dt'].dt.date
+# Month key — last day of month (becomes tx_date in the edge rollup)
+raw_df['tx_month'] = raw_df['tx_dt'].dt.to_period('M').dt.to_timestamp('M')
+# All Nov individual rows get tx_month = 2025-11-30
+
+Part 1 — Edge Table Columns (E1–E7)
+Who computes	You, offline, before feeding transactions.csv to GraphAML
+Grain	One row per (sender_id, receiver_id, tx_month) — same as your monthly rollup
+Why needed	Monthly rollup loses information about individual amounts and timing within the month
+
+E1 — count_structuring_band
+What it is: Count of individual transactions between $8,000 and $9,999.99 per pair per month.
+Why needed: Structuring = criminals deliberately keep transactions just under the $10K reporting threshold. After monthly rollup you only see the total ($97,000) — you cannot tell if 10 individual transactions were $9,700 each (structuring) vs one wire of $97,000.
+
+python
+# E1: count_structuring_band
+band = raw_df[(raw_df['amount'] >= 8000) & (raw_df['amount'] <= 9999.99)]
+e1 = (band.groupby(['sender_id', 'receiver_id', 'tx_month'])
+          .size()
+          .reset_index(name='count_structuring_band'))
+
+E2 — min_amount
+What it is: Smallest individual transaction amount for that pair-month.
+Why needed: Monthly sum hides the range. A sum of $50,000 could be one $50K wire (normal) or fifty $1,000 cash deposits (suspicious). Min reveals the smallest individual amount.
+
+python
+# E2: min_amount
+e2 = (raw_df.groupby(['sender_id', 'receiver_id', 'tx_month'])['amount']
+            .min()
+            .reset_index(name='min_amount'))
+
+E3 — max_amount
+What it is: Largest individual transaction amount for that pair-month.
+Why needed: Paired with E2. max_amount − min_amount tells the engine whether this pair uses consistently small amounts (suspicious) or varied amounts (normal business behaviour).
+
+python
+# E3: max_amount
+e3 = (raw_df.groupby(['sender_id', 'receiver_id', 'tx_month'])['amount']
+            .max()
+            .reset_index(name='max_amount'))
+
+E4 — off_hours_tx_count
+What it is: Count of individual transactions sent between 22:00 and 06:59 per pair per month.
+Why needed: The engine calculates off_hours_ratio from tx_hour. In monthly rollup, tx_date is always 2025-11-30 — no time information survives. All rows have no valid tx_hour → dropped → off_hours_ratio = 0.0 for every customer. This column restores the signal.
+
+python
+# E4: off_hours_tx_count
+off = raw_df[(raw_df['tx_hour'] >= 22) | (raw_df['tx_hour'] <= 6)]
+e4 = (off.groupby(['sender_id', 'receiver_id', 'tx_month'])
+         .size()
+         .reset_index(name='off_hours_tx_count'))
+
+E5 — round_amount_count
+What it is: Count of individual transactions where amount % 1000 < 1.0 (divisible by 1,000 within $1 tolerance).
+Why needed: The engine checks amount % 1000 < 1.0 on the monthly sum. Sum of ten $9,700 transactions = $97,000; $97,000 % 1000 = 0 → incorrectly flagged as round. This column pre-counts actually-round individual transactions before summation destroys the signal.
+
+python
+# E5: round_amount_count
+round_tx = raw_df[(raw_df['amount'] % 1000) < 1.0]
+e5 = (round_tx.groupby(['sender_id', 'receiver_id', 'tx_month'])
+              .size()
+              .reset_index(name='round_amount_count'))
+
+E6 — recent_tx_count (monthly only)
+What it is: Count of individual transactions for this pair in the most recent 30 days of your 3-month window (i.e. the November individual transactions).
+Why needed: The engine's velocity score splits tx_df into "recent 30 days" vs "baseline before that". With monthly rollup you have exactly 3 rows (Sep, Oct, Nov). The Nov row has tx_date = 2025-11-30 and days = 1, so velocity rate = tx_count / 1 instead of tx_count / 30. Completely wrong. This column provides the correct recent count.
+
+python
+# E6: recent_tx_count — individuals from the last 30 days of your window
+max_date = raw_df['tx_dt'].max()
+cutoff   = max_date - pd.Timedelta(days=30)
+recent = raw_df[raw_df['tx_dt'] >= cutoff]
+e6 = (recent.groupby(['sender_id', 'receiver_id', 'tx_month'])
+            .size()
+            .reset_index(name='recent_tx_count'))
+
+E7 — baseline_tx_count (monthly only)
+What it is: Count of individual transactions for this pair before the last 30 days (September + most of October).
+Why needed: Paired with E6. Without a baseline the engine returns 0.0 for all velocity scores. With this column the engine patch correctly compares recent vs baseline to detect customers who suddenly ramped up volume in November.
+
+python
+# E7: baseline_tx_count — individuals from before the last 30 days
+baseline = raw_df[raw_df['tx_dt'] < cutoff]
+e7 = (baseline.groupby(['sender_id', 'receiver_id', 'tx_month'])
+              .size()
+              .reset_index(name='baseline_tx_count'))
+
+Complete Edge Compensation Builder
+
+python
+def build_edge_compensation(raw_df):
+    """
+    Takes raw individual transaction dataframe.
+    Returns monthly rolled-up edge table with ALL compensation columns.
+    """
+    df = raw_df.copy()
+    df['tx_dt']    = pd.to_datetime(df['tx_datetime'])
+    df['amount']   = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
+    df['tx_hour']  = df['tx_dt'].dt.hour
+    df['tx_month'] = df['tx_dt'].dt.to_period('M').dt.to_timestamp('M')
+    # --- Base monthly rollup ---
+    base = (df.groupby(['sender_id', 'receiver_id', 'tx_month'])
+              .agg(amount=('amount', 'sum'), tx_count=('amount', 'count'))
+              .reset_index())
+    base.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    # --- E1: structuring band count ---
+    band = df[(df['amount'] >= 8000) & (df['amount'] <= 9999.99)]
+    e1 = (band.groupby(['sender_id', 'receiver_id', 'tx_month'])
+              .size().reset_index(name='count_structuring_band'))
+    e1.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    # --- E2 + E3: min and max individual amounts ---
+    e2e3 = (df.groupby(['sender_id', 'receiver_id', 'tx_month'])['amount']
+               .agg(min_amount='min', max_amount='max')
+               .reset_index())
+    e2e3.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    # --- E4: off-hours transaction count ---
+    off = df[(df['tx_hour'] >= 22) | (df['tx_hour'] <= 6)]
+    e4 = (off.groupby(['sender_id', 'receiver_id', 'tx_month'])
+             .size().reset_index(name='off_hours_tx_count'))
+    e4.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    # --- E5: round amount count ---
+    rnd = df[(df['amount'] % 1000) < 1.0]
+    e5 = (rnd.groupby(['sender_id', 'receiver_id', 'tx_month'])
+             .size().reset_index(name='round_amount_count'))
+    e5.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    # --- E6 + E7: velocity split (monthly only) ---
+    max_dt = df['tx_dt'].max()
+    cutoff = max_dt - pd.Timedelta(days=30)
+    e6 = (df[df['tx_dt'] >= cutoff]
+          .groupby(['sender_id', 'receiver_id', 'tx_month'])
+          .size().reset_index(name='recent_tx_count'))
+    e6.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    e7 = (df[df['tx_dt'] < cutoff]
+          .groupby(['sender_id', 'receiver_id', 'tx_month'])
+          .size().reset_index(name='baseline_tx_count'))
+    e7.rename(columns={'tx_month': 'tx_date'}, inplace=True)
+    # --- Merge all together ---
+    key    = ['sender_id', 'receiver_id', 'tx_date']
+    result = base.copy()
+    for extra in [e1, e2e3, e4, e5, e6, e7]:
+        result = result.merge(extra, on=key, how='left')
+    fill_int = ['count_structuring_band', 'off_hours_tx_count',
+                'round_amount_count', 'recent_tx_count', 'baseline_tx_count']
+    result[fill_int]                        = result[fill_int].fillna(0).astype(int)
+    result[['min_amount', 'max_amount']]    = result[['min_amount', 'max_amount']].fillna(0)
+    return result
+# Usage:
+edge_df = build_edge_compensation(raw_df)
+edge_df.to_csv('transactions.csv', index=False)
+
+Part 2 — Node Table Columns (N1–N6)
+Who computes	You, offline, using 90 days of raw individual transactions
+Grain	One row per customer — a stable behavioural fingerprint
+Why needed	The engine's behavioural features read tx_df dates (monthly = 30-day gaps) — all signals become flat and meaningless
+
+N1 — burstiness_b
+What it is: A score from −1 to +1 measuring whether a customer sends money irregularly (+1 = bursty/random) or like clockwork (−1 = robotic/scripted).
+Score	Interpretation	Example
+−1.0	Perfectly equal intervals; σ = 0	Bot sending $9,700 every Monday at 9am
+~0	Normal irregular human cadence	Legitimate customer
+~+1	Long silences then sudden burst activity	Cash dealer; burst laundering
+Formula: B = (σ − μ) / (σ + μ) where σ = std of inter-send gaps (seconds), μ = mean of inter-send gaps.
+
+python
+def compute_burstiness(sender_times_sorted_epoch_seconds):
+    """Input: sorted array of epoch seconds for all sends by this customer."""
+    inter = np.diff(sender_times_sorted_epoch_seconds).astype(float)
+    if len(inter) < 2:
+        return 0.0
+    mu, sigma = inter.mean(), inter.std()
+    denom = sigma + mu
+    return round(float((sigma - mu) / denom), 4) if denom > 1e-9 else 0.0
+
+N2 — benford_mad
+What it is: A score 0 to 1 measuring how abnormal the first digits of a customer's transaction amounts are. Score near 0 = normal (follows Benford's Law). Score near 1 = suspicious.
+First Digit	Benford Expected	Structurer Sending $9,700
+1	30.1%	~0%
+2	17.6%	~0%
+…	…	…
+9	4.6%	~100%
+Formula: MAD = mean(|observed_freq_d − log10(1 + 1/d)|) for digits 1–9 → normalise by 0.10 threshold → clip to 1.0.
+
+python
+BENFORD_EXPECTED = {d: np.log10(1 + 1/d) for d in range(1, 10)}
+def compute_benford_mad(amounts):
+    """Input: array of individual transaction amounts (sent + received) for this customer."""
+    amounts = np.array(amounts)
+    amounts = amounts[amounts > 0.01]
+    if len(amounts) < 30:
+        return 0.0
+    first_digits = (amounts / 10 ** np.floor(np.log10(amounts))).astype(int)
+    first_digits = first_digits[(first_digits >= 1) & (first_digits <= 9)]
+    total = len(first_digits)
+    mad = sum(abs(np.sum(first_digits == d) / total - BENFORD_EXPECTED[d])
+              for d in range(1, 10)) / 9
+    return round(min(mad / 0.10, 1.0), 4)
+
+N3 — dow_entropy
+What it is: A score 0 to 2.807 measuring how spread a customer's sending activity is across days of the week.
+Entropy	Interpretation	Pattern
+2.807 (max)	Perfectly uniform across all 7 days	Legitimate retail customer
+~1.5	Skewed but multi-day	Most normal customers
+~0	All transactions on 1–2 days	Scheduled criminal payment / weekly cash-out
+Formula: H = −Σ p_d × log₂(p_d) for each day d with at least one transaction. Max = log₂(7) = 2.807.
+
+python
+def compute_dow_entropy(sender_datetimes):
+    """Input: array of datetime values for all sends by this customer."""
+    dts = pd.to_datetime(sender_datetimes)
+    if len(dts) < 7:
+        return 0.0
+    dow_probs = dts.dayofweek.value_counts(normalize=True)
+    entropy   = -sum(p * np.log2(p + 1e-12) for p in dow_probs)
+    return round(float(entropy), 4)
+
+N4 — amount_cv
+What it is: Coefficient of Variation of a customer's individual sent amounts. CV = std / mean. Low CV ≈ 0 = suspicious robotic uniformity.
+CV	Interpretation	Example
+~0	All amounts identical	Structurer sending exactly $9,700 every time
+0.5–1.0	Moderate variation	Regular payments with some variation
+>1	High variation	Normal business ($500, $15K, $2,300, $8,900)
+Formula: CV = σ / μ on individual sent amounts (population std, ddof=0).
+
+python
+def compute_amount_cv(sent_amounts):
+    """Input: array of individual sent amounts for this customer."""
+    amounts = np.array(sent_amounts)
+    amounts = amounts[amounts > 0]
+    if len(amounts) < 2:
+        return 0.0
+    mu    = amounts.mean()
+    sigma = amounts.std(ddof=0)
+    return round(float(sigma / mu), 4) if mu > 1e-9 else 0.0
+
+N5 — dormancy_days
+What it is: The longest gap in days between any two consecutive sending dates for this customer over the 90-day window.
+Gap	Interpretation
+< 7 days	Normal (weekends, holidays)
+7–30 days	Occasional pause — common for individuals
+30–90+ days	Sleeping mule pattern — dormant then suddenly activates with large transfers
+Formula: dormancy = max(date[i+1] − date[i]) over all consecutive unique sending dates.
+
+python
+def compute_dormancy_days(sender_datetimes):
+    """Input: array of datetime values for all sends by this customer."""
+    dates = sorted(set(pd.to_datetime(sender_datetimes).dt.date))
+    if len(dates) < 2:
+        return 0
+    gaps = [(dates[i+1] - dates[i]).days for i in range(len(dates) - 1)]
+    return int(max(gaps))
+
+N6 — relay_ratio
+What it is: Fraction of money a customer sends within 24 hours of receiving money. Ratio near 1.0 = pure pass-through relay node. Ratio near 0 = holds own funds.
+Ratio	Interpretation	Pattern
+~1.0	Receives and immediately forwards	Classic money mule / relay agent
+~0.5	Partial relay	Mixed use account
+~0	Sends from own funds with no prior inbound	Normal customer
+Formula: For each outgoing transaction, look back 24 hours for an inbound receive on the same node. relay_ratio = Σ min(send_amt, recv_amt) for matched pairs / total_sent_amt. Clip to [0, 1].
+
+python
+def compute_relay_ratio_all_nodes(raw_df):
+    """
+    Vectorized — computes relay_ratio for ALL customers at once.
+    Input: raw_df with sender_id, receiver_id, tx_datetime, amount.
+    """
+    df          = raw_df.copy()
+    df['tx_dt'] = pd.to_datetime(df['tx_datetime'])
+    df['amount']= pd.to_numeric(df['amount'], errors='coerce').fillna(0)
+    send = (df[['sender_id', 'tx_dt', 'amount']]
+            .rename(columns={'sender_id': '_node', 'amount': '_send_amt'})
+            .sort_values('tx_dt').reset_index(drop=True))
+    recv = (df[['receiver_id', 'tx_dt', 'amount']]
+            .rename(columns={'receiver_id': '_node', 'amount': '_recv_amt'})
+            .sort_values('tx_dt').reset_index(drop=True))
+    matched = pd.merge_asof(
+        send, recv,
+        on='tx_dt', by='_node',
+        tolerance=pd.Timedelta(hours=24),
+        direction='backward'
+    )
+    matched_valid = matched.dropna(subset=['_recv_amt']).copy()
+    total_sent = send.groupby('_node')['_send_amt'].sum()
+    if matched_valid.empty:
+        relay = pd.Series(0.0, index=total_sent.index)
+    else:
+        matched_valid['_relay_amt'] = matched_valid[['_send_amt', '_recv_amt']].min(axis=1)
+        relay_sent = matched_valid.groupby('_node')['_relay_amt'].sum()
+        relay = (relay_sent.reindex(total_sent.index, fill_value=0.0)
+                           / total_sent.replace(0, np.nan)
+                 ).fillna(0.0).clip(0.0, 1.0).round(4)
+    return relay.reset_index().rename(columns={'_node': 'customer_id', 0: 'relay_ratio'})
+
+Complete Node Profile Builder
+
+python
+def build_node_profiles(raw_df):
+    """
+    Takes raw individual transaction dataframe (90-day window).
+    Returns nodes.csv with one row per customer and N1–N6 columns.
+    """
+    df           = raw_df.copy()
+    df['tx_dt']  = pd.to_datetime(df['tx_datetime'])
+    df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
+    all_customers = sorted(
+        set(df['sender_id'].unique()) | set(df['receiver_id'].unique())
+    )
+    records = []
+    for cust in all_customers:
+        sent = df[df['sender_id'] == cust]
+        both_amounts = pd.concat([
+            df[df['sender_id']   == cust]['amount'],
+            df[df['receiver_id'] == cust]['amount']
+        ])
+        row = {'customer_id': cust}
+        # N1 — burstiness_b
+        if len(sent) >= 3:
+            times = np.sort(sent['tx_dt'].astype('int64').values) // 10**9
+            inter = np.diff(times).astype(float)
+            if len(inter) >= 2:
+                mu, sigma = inter.mean(), inter.std()
+                row['burstiness_b'] = round((sigma - mu) / (sigma + mu), 4) if (sigma + mu) > 1e-9 else 0.0
+            else:
+                row['burstiness_b'] = 0.0
+        else:
+            row['burstiness_b'] = 0.0
+        # N2 — benford_mad
+        amts = both_amounts[both_amounts > 0.01].values
+        if len(amts) >= 30:
+            fd    = (amts / 10 ** np.floor(np.log10(amts))).astype(int)
+            fd    = fd[(fd >= 1) & (fd <= 9)]
+            total = len(fd)
+            mad   = sum(abs(np.sum(fd == d) / total - np.log10(1 + 1/d)) for d in range(1, 10)) / 9
+            row['benford_mad'] = round(min(mad / 0.10, 1.0), 4)
+        else:
+            row['benford_mad'] = 0.0
+        # N3 — dow_entropy
+        if len(sent) >= 7:
+            probs = sent['tx_dt'].dt.dayofweek.value_counts(normalize=True)
+            row['dow_entropy'] = round(float(-sum(p * np.log2(p + 1e-12) for p in probs)), 4)
+        else:
+            row['dow_entropy'] = 0.0
+        # N4 — amount_cv
+        sa = sent['amount'][sent['amount'] > 0].values
+        if len(sa) >= 2:
+            mu_a = sa.mean()
+            row['amount_cv'] = round(sa.std(ddof=0) / mu_a, 4) if mu_a > 1e-9 else 0.0
+        else:
+            row['amount_cv'] = 0.0
+        # N5 — dormancy_days
+        dates = sorted(set(sent['tx_dt'].dt.date))
+        row['dormancy_days'] = max(
+            ((dates[i+1] - dates[i]).days for i in range(len(dates) - 1)), default=0
+        ) if len(dates) >= 2 else 0
+        records.append(row)
+    # N6 — relay_ratio (vectorized for all nodes at once)
+    relay_df = compute_relay_ratio_all_nodes(raw_df)
+    node_df  = pd.DataFrame(records)
+    node_df  = node_df.merge(relay_df, on='customer_id', how='left')
+    node_df['relay_ratio'] = node_df['relay_ratio'].fillna(0.0)
+    return node_df
+# Usage:
+node_df = build_node_profiles(raw_df)
+node_df.to_csv('nodes.csv', index=False)
+
+Summary — What Each Column Fixes
+#	Column	Table	Engine Feature Restored	Failure Without It	Min Data Required
+#	Column	Table	Engine Feature Restored	Failure Without It	Min Data Required
+E1	count_structuring_band	Edge	structuring_score Tier 1	Falls to unit-amount proxy; false negatives on split structuring	1 txn in $8K–$10K range
+E2	min_amount	Edge	structuring_score Tier 2	No range info; Tier 3 fallback without E3 pair	1 txn
+E3	max_amount	Edge	structuring_score Tier 2	No range info; Tier 3 fallback without E2 pair	1 txn
+E4	off_hours_tx_count	Edge	off_hours_ratio	off_hours_ratio = 0.0 for ALL nodes — no tx_hour in rollup	1 off-hours txn
+E5	round_amount_count	Edge	round_amount_rate	Round-amount check on monthly sum gives wrong result	1 round txn
+E6	recent_tx_count	Edge	velocity_delta_z	Velocity rate = tx_count / 1 day instead of / 30	Monthly only
+E7	baseline_tx_count	Edge	velocity_delta_z	Baseline empty → all velocity scores = 0.0	Monthly only
+N1	burstiness_b	Node	goh_barabasi_b	Period dates = identical gaps → B = −1 for everyone	3 sends
+N2	benford_mad	Node	benford_mad	Period sums destroy first-digit law; < 30 threshold fails	30 txns
+N3	dow_entropy	Node	dow_entropy	Monthly date = same DOW for all → entropy identical across all nodes	7 sends
+N4	amount_cv	Node	amount_cv	CV of 3 monthly sums ≠ CV of 60+ individual amounts — semantically wrong	2 sends
+N5	dormancy_days	Node	dormancy_days	All monthly gaps ≈ 30d for every active customer — signal flat	2 send dates
+N6	relay_ratio	Node	relay_score	All monthly rows same date → relay = 1.0 for every node	1 send + 1 recv
+
+
+
+
+
+
+
+
+
