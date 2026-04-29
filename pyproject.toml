@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "network-analyzer"
+version = "3.0.0"
+description = "Network Analyzer v3 — analyze network interfaces, connectivity, and services"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+dependencies = [
+    "psutil>=5.9.0",
+    "dnspython>=2.4.0",
+]
+
+[project.scripts]
+network-analyzer = "network_analyzer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["network_analyzer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
